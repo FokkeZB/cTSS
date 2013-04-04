@@ -1,0 +1,365 @@
+<html>
+	<head>
+		<title>cTSS</title>
+		<script src="cssParser.js"></script>
+		<script src="Slick.Parser.js"></script>
+		<script src="underscore.js"></script>
+		<script>
+
+			/* TODO
+			- Able to parse css properties without selector-block
+			- View:focus{background:red} > View { backgroundFocussedColor: 'red' }
+			*/
+
+			var tss;
+
+			function parseCSS() {
+				var parser = new cTSS();
+
+				var css_string = document.getElementById('css').value;
+
+				parser.parse(css_string);
+
+				document.getElementById('tss').value = parser.getAsString();
+			}
+
+			function cTSS(css_string) {
+				this.CSSParser = new CSSParser();
+				this.tss = {};
+
+				this.property_map = {
+					'color': true,
+					'background-color': true,
+					'border-color': true,
+					'border-radius': true,
+					'border-width': 'borderSize',
+					'top': true,
+					'right': true,
+					'bottom': true,
+					'left': true,
+					'width': true,
+					'height':true,
+					'z-index': true
+				};
+				
+				if (typeof css_string === 'string') {
+					this.parse(css_string);
+				}
+			}
+
+			cTSS.prototype = {
+
+				parse: function (css_string) {
+					var css = this.CSSParser.parse(css_string, false, true);
+
+					console.debug('css', css);
+
+					this.tss = {};
+
+					_.each(css.cssRules, this.parseRule, this);
+
+					console.debug('tss', this.tss);
+				},
+
+				parseRule: function (rule) {
+					console.debug('rule', rule);
+
+					if (this.parseSelectors(rule.mSelectorText)) {
+
+						if (this.parseDeclarations(rule.declarations)) {
+
+							_.each(this.current_tss_selectors, function (selector) {
+
+								if (this.tss[selector]) {
+									_.extend(this.tss[selector], this.current_tss_properties);
+								} else {
+									this.tss[selector] = this.current_tss_properties;
+								}
+								
+							}, this);
+						}
+					}
+				},
+
+				parseSelectors: function(mSelectorText) {
+					var selectors = Slick.parse(mSelectorText);
+
+					console.debug('selectors', selectors);
+
+					this.current_css_selectors = selectors;
+					this.current_tss_selectors = [];
+
+					_.each(selectors.expressions, this.parseSelector, this);
+
+					if (this.current_tss_selectors.length > 0) {
+						console.debug('Parsed selectors', this.current_tss_selectors);
+
+						return true;
+
+					} else {
+						console.warn('No supported selectors found in: ' + this.current_css_selectors.raw);
+
+						return false;
+					}
+				},
+
+				parseSelector: function(selector) {
+
+					if (selector.length > 1) {
+						console.info('Skipping descendent selection in: ' + this.current_css_selectors.raw);
+					}
+
+					var selector = _.last(selector);
+
+					console.debug('selector', selector);
+
+					if (selector.pseudos) {
+						console.info('Skipping pseudo selection in: ' + this.current_css_selectors.raw);
+					}
+
+					if (selector.attributes) {
+						console.info('Skipping attribute selection in: ' + this.current_css_selectors.raw);
+					}
+
+					if (selector.tag && selector.tag !== '*') {
+						this.current_tss_selectors.push(selector.tag);
+					}
+
+					if (selector.classList) {
+						_.map(selector.classList, function (cls) {
+							this.current_tss_selectors.push('.' + cls);
+						}, this);
+					}
+
+					if (selector.id) {
+						this.current_tss_selectors.push('#' + selector.id);
+					}
+				},
+
+				parseDeclarations: function (declarations) {
+					this.current_tss_properties = {};
+					this.current_css_declarations_unsupported = [];
+
+					_.each(declarations, this.parseDeclaration, this);
+
+					if (_.size(this.current_tss_properties) > 0) {
+						console.debug('Parsed properties', this.current_tss_properties);
+
+						return true;
+
+					} else {
+						console.warn('No supported properties found in: ' + this.current_css_declarations_unsupported);
+
+						return false;
+					}
+				},
+
+				parseDeclaration: function (declaration) {
+
+					if (declaration.type !== kJscsspSTYLE_DECLARATION) {
+						return;
+					}
+
+					console.debug('declaration', declaration);
+					
+					declaration.property = declaration.property
+						.replace('-top-', '-')
+						.replace('-right-', '-')
+						.replace('-bottom-', '-')
+						.replace('-left-', '-');
+						
+					if (this.property_map[declaration.property]) {
+					
+						if (this.property_map[declaration.property] === true) {
+							var property = this._camelCase(declaration.property);
+						} else {
+							property = this.property_map[declaration.property];
+						}
+
+						this.current_tss_properties[property] = declaration.valueText;
+
+					} else if (declaration.property == 'background-image') {
+						var property = this._camelCase(declaration.property);
+
+						var parsed = CssInspector.parseBackgroundImages(declaration.valueText);
+
+						if (parsed) {
+
+							if (parsed[0].type === 'image') {
+								this.current_tss_properties[property] = parsed[0].value.replace(/^url|[\(\)\"\']/g, '');
+							
+							} else if (parsed[0].type == 'linear-gradient') {
+
+								var value = {};
+								value.type = 'linear';
+
+								value.colors = [];
+
+								_.each(parsed[0].value.stops, function(stop) {
+
+									value.colors.push({
+										color: stop.color,
+										stop: stop.position,
+									});
+
+								}, this);
+
+								this.current_tss_properties[property] = value;
+							}
+						}
+
+					} else {
+						this.current_css_declarations_unsupported.push(declaration.parsedCssText);
+
+						console.info('Skipping unsupported declaration: ' + declaration.parsedCssText);
+					}
+				},
+
+				getAsObject: function () {
+					return this.tss;
+				},
+
+				getAsString: function () {
+					var string = '';
+
+					_.each(this.tss, function (properties, selector) {
+						string += '"' + selector + "\": {\n";
+						string += this._recurseProperties(properties, "\t");
+						string += "}\n\n";
+					}, this);
+
+					return string;
+				},
+
+				_recurseProperties: function (properties, indent, inArray) {
+					var string = '';
+
+					var i = 0, ln = _.size(properties);
+
+					_.each(properties, function (value, property) {
+						string += indent;
+
+						if (!inArray || typeof property !== 'number') {
+							string += property + ': ';
+						}
+
+						if (typeof value === 'string') {
+							string += "'" + value + "'";
+						
+						} else {
+							var className = toString.call(value);
+							var isArray = (className === '[object Array]');
+
+							string += isArray ? "[\n" : "{\n";
+							string += this._recurseProperties(value, indent + "\t", isArray);
+							string += indent;
+							string += isArray ? "]" : "}";
+						}
+
+						i++;
+
+						if (i < ln) {
+							string += ',';
+						}
+
+						string += "\n";
+
+					}, this);
+
+					return string;
+				},
+
+				_camelCase: function (property) {
+					var property = property
+						.replace('-', ' ')
+						.replace(/^([a-z\u00E0-\u00FC])|\s+([a-z\u00E0-\u00FC])/g, function ($1) {
+							return $1.toUpperCase();
+							})
+						.replace(' ', '');
+
+					property = property.charAt(0).toLowerCase() + property.substr(1);
+
+ 					return property;
+				}
+			}
+
+		</script>
+		<style>
+
+			html, body {
+				width: 100%;
+				height: 100%;
+
+				background: black;
+				margin: 0;
+				padding: 0;
+			}
+
+			.wrapper {
+				width: 50%;
+				height: 100%;
+
+				position: absolute;
+				top: 0;
+			}
+
+			#tss_wrapper {
+				left: 50%;
+			}
+
+			textarea {
+				margin-top: 50px;
+				width: 100%;
+				height: 100%;
+
+				background: black;
+				color: white;
+				font-family: 'Courier New', Courier;
+				font-size: 12px;
+				border: 2px solid white;
+			}
+
+			#toolbar {
+				width: 100%;
+				height: 50px;
+
+				position: absolute;
+				top: 0;
+				left: 0;
+
+				background-color: white;
+			}
+
+			input {
+				position: absolute;
+				top: 10px;
+				left: 50%;
+				margin-left: -50px;
+				
+				width: 100px;
+				height: 30px;
+				border: 0;
+			}
+
+		</style>
+	</head>
+	<body>
+		<div id="css_wrapper" class="wrapper">
+			<textarea id="css">
+
+#id {
+	border: 1px solid black;
+	border-radius: 5px;
+	background: red url('background.png');
+}
+
+			</textarea>
+		</div>
+		<div id="tss_wrapper" class="wrapper">
+			<textarea id="tss"></textarea>
+		</div>
+		<div id="toolbar">
+			<input type="submit" onclick="parseCSS()" value="Parse" />
+		</div>
+	</body>
+</html>
